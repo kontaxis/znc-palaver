@@ -7,7 +7,9 @@
 
 #define REQUIRESSL
 
-#define ZNC_PALAVER_VERSION "1.2.1"
+#define ZNC_PALAVER_VERSION "1.2.2"
+
+#include <algorithm>
 
 #include <znc/Modules.h>
 #include <znc/User.h>
@@ -67,6 +69,69 @@ CString re_escape(const CString& sString) {
 }
 #endif
 
+struct PLVURL {
+	CString scheme;
+	CString host;
+	int port;
+	CString path;
+
+	PLVURL(CString sURL) {
+		scheme = sURL.Token(0, false, "://");
+		CString sTemp = sURL.Token(1, true, "://");
+		CString sAddress = sTemp.Token(0, false, "/");
+
+		host = sAddress.Token(0, false, ":");
+		CString sPort = sAddress.Token(1, true, ":");
+		path = "/" + sTemp.Token(1, true, "/");
+
+		if (sPort.empty()) {
+			if (scheme.Equals("https")) {
+				port = 443;
+			} else if (scheme.Equals("http")) {
+				port = 80;
+			} else {
+				port = 80;
+			}
+		} else {
+			port = sPort.ToUShort();
+		}
+	}
+};
+
+struct PLVHTTPMessage {
+	MCString headers;
+	CString body;
+
+	PLVHTTPMessage(MCString h, CString b) : headers(h), body(b) {
+	}
+};
+
+struct PLVHTTPRequest : PLVHTTPMessage {
+	PLVURL url;
+	CString method;
+
+	PLVHTTPRequest(PLVURL u, CString m, MCString h, CString b) : PLVHTTPMessage(h, b), url(u), method(m) {
+	};
+};
+
+class RetryStrategy {
+public:
+	bool ShouldRetryRequest(unsigned int status) {
+		bool isRateLimited = status == 429;
+		bool is5xx = status >= 500 && status <= 600;
+		return isRateLimited || is5xx;
+	}
+
+	unsigned int GetMaximumRetryAttempts() {
+		return 5;
+	}
+
+	unsigned int GetDelay(unsigned int uAttempts) {
+		unsigned int minimumBackoff = 1;
+		unsigned int maximumBackoff = 10;
+		return std::max(std::min(uAttempts * 2, maximumBackoff), minimumBackoff);
+	}
+};
 
 typedef enum {
 	StatusLine = 0,
@@ -79,47 +144,32 @@ class PLVHTTPSocket : public CSocket {
 	EPLVHTTPSocketState m_eState;
 
 public:
-	PLVHTTPSocket(CModule *pModule, const CString &sMethod, const CString &sURL, MCString &mcsHeaders, const CString &sContent) : CSocket(pModule) {
+	std::shared_ptr<PLVHTTPRequest> m_request;
+	unsigned int m_attempts;
+
+	PLVHTTPSocket(CModule *pModule, PLVURL url) : CSocket(pModule) {
 		m_eState = StatusLine;
+		m_sHostname = url.host;
 
-		unsigned short uPort = 80;
+		bool useSSL = url.scheme.Equals("https");
 
-		CString sScheme = sURL.Token(0, false, "://");
-		CString sTemp = sURL.Token(1, true, "://");
-		CString sAddress = sTemp.Token(0, false, "/");
+		DEBUG("Palaver: Connecting to '" << url.host << "' on port " << url.port << (useSSL ? " with" : " without") << " TLS");
 
-		m_sHostname = sAddress.Token(0, false, ":");
-		CString sPort = sAddress.Token(1, true, ":");
-		CString sPath = "/" + sTemp.Token(1, true, "/");
-
-		if (sPort.empty()) {
-			if (sScheme.Equals("https")) {
-				uPort = 443;
-			} else if (sScheme.Equals("http")) {
-				uPort = 80;
-			}
-		} else {
-			uPort = sPort.ToUShort();
-		}
-
-		mcsHeaders["Connection"] = "close";
-		// as per https://tools.ietf.org/html/rfc7231#section-5.5.3
-		mcsHeaders["User-Agent"] = "znc-palaver/" + CString(ZNC_PALAVER_VERSION) + " znc/" + CZNC::GetVersion();
-
-		if (sMethod.Equals("GET") == false || sContent.length() > 0) {
-			mcsHeaders["Content-Length"] = CString(sContent.length());
-		}
-
-		bool useSSL = sScheme.Equals("https");
-
-		DEBUG("Palaver: Connecting to '" << m_sHostname << "' on port " << uPort << (useSSL ? " with" : " without") << " TLS (" << sMethod << " " << sPath << ")");
-
-		Connect(m_sHostname, uPort, useSSL);
+		Connect(url.host, url.port, useSSL);
 		EnableReadLine();
-		Write(sMethod + " " + sPath + " HTTP/1.1\r\n");
-		Write("Host: " + m_sHostname + "\r\n");
+	}
 
-		for (MCString::const_iterator it = mcsHeaders.begin(); it != mcsHeaders.end(); ++it) {
+	void Send(std::shared_ptr<PLVHTTPRequest> request, unsigned int attempts) {
+		m_eState = StatusLine;
+		m_request = request;
+		m_attempts = attempts;
+
+		Write(request.get()->method + " " + request.get()->url.path + " HTTP/1.1\r\n");
+		Write("Host: " + request.get()->url.host + "\r\n");
+		Write("Connection: close\r\n");
+		Write("Content-Length: " + CString(request.get()->body.length()) + "\r\n");
+
+		for (MCString::const_iterator it = request.get()->headers.begin(); it != request.get()->headers.end(); ++it) {
 			const CString &sKey = it->first;
 			const CString &sValue = it->second;
 
@@ -128,12 +178,16 @@ public:
 
 		Write("\r\n");
 
-		if (sContent.length() > 0) {
-			Write(sContent);
+		if (request.get()->body.length() > 0) {
+			Write(request.get()->body);
 		}
 	}
 
 	virtual void HandleStatusCode(unsigned int status) {
+
+	}
+
+	virtual void RetryRequest() {
 
 	}
 
@@ -180,18 +234,37 @@ public:
 
 	void Disconnected() {
 		Close(CSocket::CLT_AFTERWRITE);
+
+		if (m_eState == StatusLine) {
+			// If we've already processed the status line, we've already
+			// fired the handle status (and thus an error is not appropriate).
+			RetryRequest();
+		}
 	}
 
 	void Timeout() {
 		DEBUG("Palaver: HTTP Request timed out '" << m_sHostname << "'");
+
+		if (m_eState == StatusLine) {
+			// If we've already processed the status line, we've already
+			// fired the handle status (and thus an error is not appropriate).
+			RetryRequest();
+		}
 	}
 
 	void ConnectionRefused() {
 		DEBUG("Palaver: Connection refused to '" << m_sHostname << "'");
+		RetryRequest();
 	}
 
 	virtual void SockError(int iErrno, const CString &sDescription) {
 		DEBUG("Palaver: HTTP Request failed '" << m_sHostname << "' - " << sDescription);
+
+		if (m_eState == StatusLine) {
+			// If we've already processed the status line, we;ve already
+			// fired the handle status (and thus an error is not appropriate).
+			RetryRequest();
+		}
 	}
 
 	virtual bool SNIConfigureClient(CS_STRING &sHostname) {
@@ -205,11 +278,12 @@ private:
 
 class PLVHTTPNotificationSocket : public PLVHTTPSocket {
 public:
-	PLVHTTPNotificationSocket(CModule *pModule, const CString &sIdentifier, const CString &sMethod, const CString &sURL, MCString &mcsHeaders, const CString &sContent) : PLVHTTPSocket(pModule, sMethod, sURL, mcsHeaders, sContent) {
+	PLVHTTPNotificationSocket(CModule *pModule, const CString &sIdentifier, PLVURL url) : PLVHTTPSocket(pModule, url) {
 		m_sIdentifier = sIdentifier;
 	}
 
 	virtual void HandleStatusCode(unsigned int status);
+	virtual void RetryRequest();
 
 private:
 	CString m_sIdentifier;
@@ -257,6 +331,10 @@ public:
 
 	CString GetPushEndpoint() const {
 		return m_sPushEndpoint;
+	}
+
+	PLVURL GetPushURL() const {
+		return PLVURL(m_sPushEndpoint);
 	}
 
 	void SetShowMessagePreview(bool bShowMessagePreview) {
@@ -590,7 +668,7 @@ public:
 		return bResult;
 	}
 
-#pragma mark - Serialization
+// MARK: - Serialization
 
 	void ParseLine(const CString& sLine) {
 		if (InNegotiation() == false) {
@@ -720,20 +798,10 @@ public:
 		File.Write("END\n");
 	}
 
-#pragma mark - Notifications
+// MARK: - Notifications
 
 	void SendNotification(CModule& module, const CString& sSender, const CString& sNotification, const CChan *pChannel, CString sIntent = "") {
 		++m_uiBadge;
-
-		MCString mcsHeaders;
-
-		CString token = GetPushToken();
-		if (token.empty()) {
-			token = GetIdentifier();
-		}
-
-		mcsHeaders["Authorization"] = CString("Bearer " + token);
-		mcsHeaders["Content-Type"] = "application/json";
 
 		CString sJSON = "{";
 		sJSON += "\"badge\": " + CString(m_uiBadge);
@@ -757,26 +825,34 @@ public:
 		}
 		sJSON += "}";
 
-		PLVHTTPSocket *pSocket = new PLVHTTPNotificationSocket(&module, token, "POST", GetPushEndpoint(), mcsHeaders, sJSON);
+		MCString mcsHeaders;
+
+		SendNotificationRequest(module, sJSON);
+	}
+
+	void SendNotificationRequest(CModule& module, CString sJSONBody) {
+		MCString mcsHeaders;
+
+		CString token = GetPushToken();
+		if (token.empty()) {
+			token = GetIdentifier();
+		}
+
+		mcsHeaders["Authorization"] = CString("Bearer " + token);
+		mcsHeaders["Content-Type"] = "application/json";
+		mcsHeaders["User-Agent"] = "znc-palaver/" + CString(ZNC_PALAVER_VERSION) + " znc/" + CZNC::GetVersion();
+
+		std::shared_ptr<PLVHTTPRequest> request = std::make_shared<PLVHTTPRequest>(GetPushURL(), "POST", mcsHeaders, sJSONBody);
+		PLVHTTPSocket *pSocket = new PLVHTTPNotificationSocket(&module, token, GetPushURL());
+		pSocket->Send(request, 0);
 		module.AddSocket(pSocket);
 	}
 
 	void ClearBadges(CModule& module, bool bInformAPI) {
 		if (m_uiBadge != 0) {
 			if (bInformAPI) {
-				MCString mcsHeaders;
-
-				CString token = GetPushToken();
-				if (token.empty()) {
-					token = GetIdentifier();
-				}
-				mcsHeaders["Authorization"] = CString("Bearer " + token);
-				mcsHeaders["Content-Type"] = "application/json";
-
 				CString sJSON = "{\"badge\": 0}";
-
-				PLVHTTPSocket *pSocket = new PLVHTTPNotificationSocket(&module, token, "POST", GetPushEndpoint(), mcsHeaders, sJSON);
-				module.AddSocket(pSocket);
+				SendNotificationRequest(module, sJSON);
 			}
 
 			m_uiBadge = 0;
@@ -857,7 +933,7 @@ public:
 	}
 #endif
 
-#pragma mark - Cap
+// MARK: - Cap
 
 	virtual void OnClientCapLs(CClient* pClient, SCString& ssCaps) {
 		ssCaps.insert(kPLVCapability);
@@ -867,7 +943,7 @@ public:
 		return sCap.Equals(kPLVCapability);
 	}
 
-#pragma mark -
+// MARK: -
 
 	virtual EModRet OnUserRaw(CString& sLine) {
 		return HandleUserRaw(m_pClient, sLine);
@@ -946,7 +1022,7 @@ public:
 		return CONTINUE;
 	}
 
-#pragma mark -
+// MARK: -
 
 	virtual void OnClientLogin() {
 		CIRCNetwork *pNetwork = GetClient()->GetNetwork();
@@ -982,7 +1058,7 @@ public:
 		}
 	}
 
-#pragma mark -
+// MARK: -
 
 	CDevice& DeviceWithIdentifier(const CString& sIdentifier) {
 		CDevice *pDevice = NULL;
@@ -1036,7 +1112,13 @@ public:
 		return false;
 	}
 
-#pragma mark - Serialization
+	void SendRequest(const CString &sIdentifier, std::shared_ptr<PLVHTTPRequest> request, unsigned int attempts) {
+		PLVHTTPSocket *pSocket = new PLVHTTPNotificationSocket(this, sIdentifier, request.get()->url);
+		pSocket->Send(request, attempts);
+		AddSocket(pSocket);
+	}
+
+// MARK: - Serialization
 
 	CString GetConfigPath() const {
 		return (GetSavePath() + "/palaver.conf");
@@ -1124,7 +1206,7 @@ public:
 		delete pFile;
 	}
 
-#pragma mark -
+// MARK: -
 
 	void ParseMessage(CNick& Nick, CString& sMessage, CChan *pChannel = NULL, CString sIntent = "") {
 		if (m_pNetwork->IsUserOnline() == false) {
@@ -1190,7 +1272,7 @@ public:
 		return CONTINUE;
 	}
 
-#pragma mark - Commands
+// MARK: - Commands
 
 	void HandleTestCommand(const CString& sLine) {
 		if (m_pNetwork) {
@@ -1297,12 +1379,59 @@ private:
 	std::vector<CDevice*> m_vDevices;
 };
 
+class PLVRetryTimer : public CTimer {
+  public:
+	PLVRetryTimer(
+		CModule* pModule,
+		unsigned int uDelay,
+		const CString& sLabel,
+		const CString& sDescription,
+		const CString& sIdentifier,
+		std::shared_ptr<PLVHTTPRequest> request,
+		unsigned int uAttempts
+	) : CTimer(pModule, uDelay, 1, sLabel, sDescription)
+	{
+		m_sIdentifier = sIdentifier;
+		m_request = request;
+		m_uAttempts = uAttempts;
+	}
+	~PLVRetryTimer() override {}
+
+  private:
+	CString m_sIdentifier;
+	std::shared_ptr<PLVHTTPRequest> m_request;
+	unsigned int m_uAttempts;
+
+  protected:
+	void RunJob() override {
+		if (CPalaverMod *pModule = dynamic_cast<CPalaverMod *>(m_pModule)) {
+			pModule->SendRequest(m_sIdentifier, m_request, m_uAttempts);
+		}
+	}
+};
+
+void PLVHTTPNotificationSocket::RetryRequest() {
+	RetryStrategy retryStrategy = RetryStrategy();
+	if (retryStrategy.GetMaximumRetryAttempts() > (m_attempts + 1)) {
+		DEBUG("palaver: Retrying failed request");
+		m_pModule->AddTimer(
+			new PLVRetryTimer(m_pModule, retryStrategy.GetDelay(m_attempts + 1), "Request Retry", "Retry a failed pysh notification", m_sIdentifier, m_request, m_attempts + 1)
+		);
+	}
+}
+
 void PLVHTTPNotificationSocket::HandleStatusCode(unsigned int status) {
-	if (status == 401) {
+	if (status == 401 || status == 404) {
 		if (CPalaverMod *pModule = dynamic_cast<CPalaverMod *>(m_pModule)) {
 			DEBUG("palaver: Removing device");
 			pModule->RemoveDeviceWithIdentifier(m_sIdentifier);
 		}
+		return;
+	}
+
+	RetryStrategy retryStrategy = RetryStrategy();
+	if (retryStrategy.ShouldRetryRequest(status)) {
+		RetryRequest();
 	}
 }
 
